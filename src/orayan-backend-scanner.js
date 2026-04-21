@@ -93,11 +93,11 @@ function cleanupSignals() {
 }
 
 function mergeSignal(signal) {
+  // Block if same sym+side already has an open (non-closed) signal
   const exists = serverSignals.some((s) =>
     s.sym === signal.sym &&
     s.side === signal.side &&
-    Math.abs(Number(s.entry) - Number(signal.entry)) / Math.max(Number(signal.entry), 1e-9) < 0.0001 &&
-    Math.abs((s.createdAt || 0) - (signal.createdAt || 0)) < 30 * 60 * 1000
+    s.result === "OPEN"
   );
   if (exists) return false;
 
