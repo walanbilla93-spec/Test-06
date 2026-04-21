@@ -1,6 +1,6 @@
 const path = require("path");
 const express = require("express");
-const { startServerScanner, getSignals, getScannerStatus } = require("./src/orayan-backend-scanner");
+const { startServerScanner, getSignals, getPrices, getScannerStatus } = require("./src/orayan-backend-scanner");
 const { readJournal } = require("./src/signal-journal");
 
 const app = express();
@@ -21,6 +21,13 @@ app.get("/api/server-signals", (req, res) => {
   res.json({
     ok: true,
     signals: getSignals(),
+  });
+});
+
+app.get("/api/prices", (req, res) => {
+  res.json({
+    ok: true,
+    prices: getPrices(),
   });
 });
 
