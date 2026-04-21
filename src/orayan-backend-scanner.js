@@ -2,6 +2,7 @@ const axios = require("axios");
 const { appendJournalEntry } = require("./signal-journal");
 
 let serverSignals = [];
+let lastPrices = []; // store last fetched prices for /api/prices endpoint
 
 const MAX_STORED_SIGNALS = 60;
 const MAX_JOURNAL = 1000;
@@ -112,14 +113,24 @@ async function runScan() {
   scannerStatus.lastRunAt = new Date().toISOString();
 
   try {
-    const res = await axios.get("https://api.binance.com/api/v3/ticker/price", { timeout: 15000 });
+    const res = await axios.get("https://api.binance.com/api/v3/ticker/24hr", { timeout: 15000 });
     const rows = Array.isArray(res.data) ? res.data : [];
     const usdtPairs = rows.filter((r) => typeof r.symbol === "string" && r.symbol.endsWith("USDT")).slice(0, 80);
     scannerStatus.pairsChecked = usdtPairs.length;
 
+    // Store prices for /api/prices — include 24hr change data
+    lastPrices = usdtPairs.map((r) => ({
+      symbol: r.symbol,
+      price: r.lastPrice,
+      change: parseFloat(r.priceChangePercent) || 0,
+      volume: parseFloat(r.quoteVolume) || 0,
+      high: r.highPrice,
+      low: r.lowPrice,
+    }));
+
     let added = 0;
     for (const pair of usdtPairs) {
-      const rawPrice = Number(pair.price);
+      const rawPrice = Number(pair.lastPrice);
       if (!rawPrice || !Number.isFinite(rawPrice)) continue;
 
       // Testing-only synthetic score so the UI gets data while you validate deployment.
@@ -156,6 +167,10 @@ function getSignals() {
   return serverSignals.slice(0, MAX_STORED_SIGNALS);
 }
 
+function getPrices() {
+  return lastPrices;
+}
+
 function getScannerStatus() {
   cleanupSignals();
   return {
@@ -167,5 +182,6 @@ function getScannerStatus() {
 module.exports = {
   startServerScanner,
   getSignals,
+  getPrices,
   getScannerStatus,
 };
