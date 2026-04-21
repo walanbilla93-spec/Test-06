@@ -1,0 +1,17 @@
+{
+  "name": "orayan-backend",
+  "version": "4.1.0",
+  "description": "Orayan Structure Hunter \u2014 Northflank backend with server-side scanner",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
