@@ -2,11 +2,8 @@ const axios = require("axios");
 const { appendJournalEntry } = require("./signal-journal");
 
 let serverSignals = [];
-let lastPrices = []; // store last fetched prices for /api/prices endpoint
 
-const MAX_STORED_SIGNALS = 60;
-const MAX_JOURNAL = 1000;
-const MIN_SCORE = 8;
+const MAX_STORED_SIGNALS = 120;
 const SIGNAL_TTL_MS = 2 * 60 * 60 * 1000;
 
 let scannerStatus = {
@@ -26,39 +23,60 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+/**
+ * Unified 0-100 score.
+ * This is still a lightweight backend placeholder score, but the output
+ * scale is now 0-100 everywhere instead of 8-12.
+ */
+function computeUnifiedScore100(symbol, price) {
+  const chars = String(symbol || "").split("");
+  const hash = chars.reduce((a, ch, i) => a + ch.charCodeAt(0) * (i + 1), 0);
+
+  const priceNum = Number(price || 0);
+  const frac = Math.abs(priceNum % 1);
+  const fracScore = Math.floor(frac * 100);
+
+  // Base range roughly 35-95 so table doesn't fill with useless 0-5 values
+  const base = 35 + (hash % 45);          // 35-79
+  const boost = fracScore % 22;           // 0-21
+  return clamp(base + boost, 0, 100);     // 35-100
+}
+
 function pickSide(symbol, score) {
-  const n = symbol.split("").reduce((a, ch) => a + ch.charCodeAt(0), 0);
-  return ((n + score) % 2 === 0) ? "BUY" : "SELL";
+  const seed = String(symbol || "").split("").reduce((a, ch) => a + ch.charCodeAt(0), 0);
+  return ((seed + score) % 2 === 0) ? "BUY" : "SELL";
 }
 
 function makeSignal(symbol, price, score) {
   const side = pickSide(symbol, score);
-  const move1 = 0.0035;
-  const move2 = 0.0065;
-  const stop  = 0.0025;
+
+  // Keep one target field for compatibility with existing UI logic.
+  // tp1 is the profit target used by the table.
+  const move = 0.0035;
+  const stop = 0.0025;
 
   const entry = Number(price);
-  const tp1 = side === "BUY" ? entry * (1 + move1) : entry * (1 - move1);
-  const tp2 = side === "BUY" ? entry * (1 + move2) : entry * (1 - move2);
-  const sl  = side === "BUY" ? entry * (1 - stop)  : entry * (1 + stop);
+  const tp1 = side === "BUY" ? entry * (1 + move) : entry * (1 - move);
+  const sl  = side === "BUY" ? entry * (1 - stop) : entry * (1 + stop);
 
   const ts = Date.now();
+
   return {
     id: `${symbol}-${ts}`,
     sym: symbol,
     symbol,
     side,
-    score,
+    score,               // unified 0-100 score
     entry: Number(entry.toFixed(entry < 1 ? 6 : 4)),
     tp1: Number(tp1.toFixed(entry < 1 ? 6 : 4)),
-    tp2: Number(tp2.toFixed(entry < 1 ? 6 : 4)),
     sl: Number(sl.toFixed(entry < 1 ? 6 : 4)),
     time: fmtTime(new Date(ts)),
     createdAt: ts,
+    updatedAt: ts,
     status: "DETECTED",
     source: "server",
-    tp1Hit: false,
     entryHit: false,
+    tp1Hit: false,
     result: "OPEN",
     price: Number(entry.toFixed(entry < 1 ? 6 : 4)),
   };
@@ -73,8 +91,8 @@ function makeJournalEntry(signal) {
     entry: signal.entry,
     sl: signal.sl,
     tp1: signal.tp1,
-    tp2: signal.tp2,
     result: "OPEN",
+    score: signal.score,
     entryHit: false,
     createdAt: signal.createdAt,
     source: "server",
@@ -86,26 +104,45 @@ function cleanupSignals() {
   serverSignals = serverSignals
     .map((s) => {
       if (s.status === "DETECTED" && now - s.createdAt > SIGNAL_TTL_MS) {
-        return { ...s, status: "EXPIRED", result: "INVALID" };
+        return { ...s, status: "EXPIRED", result: "INVALID", updatedAt: now };
       }
       return s;
     })
     .slice(0, MAX_STORED_SIGNALS);
 }
 
-function mergeSignal(signal) {
-  // Block if same sym+side already has an open (non-closed) signal
-  const exists = serverSignals.some((s) =>
+function isDuplicateSignal(signal) {
+  return serverSignals.some((s) =>
     s.sym === signal.sym &&
     s.side === signal.side &&
-    s.result === "OPEN"
+    Math.abs(Number(s.entry) - Number(signal.entry)) / Math.max(Number(signal.entry), 1e-9) < 0.0001 &&
+    Math.abs((s.createdAt || 0) - (signal.createdAt || 0)) < 30 * 60 * 1000
   );
-  if (exists) return false;
+}
 
+function pushSignal(signal) {
+  if (isDuplicateSignal(signal)) return false;
   serverSignals.unshift(signal);
   serverSignals = serverSignals.slice(0, MAX_STORED_SIGNALS);
   appendJournalEntry(makeJournalEntry(signal));
   return true;
+}
+
+async function fetchPairs() {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 OrayanScanner/1.0",
+    "Accept": "application/json"
+  };
+
+  const res = await axios.get(
+    "https://api.binance.com/api/v3/ticker/price",
+    { timeout: 15000, headers }
+  );
+
+  const rows = Array.isArray(res.data) ? res.data : [];
+
+  // Scan all available USDT spot pairs from the API response.
+  return rows.filter((r) => typeof r.symbol === "string" && r.symbol.endsWith("USDT"));
 }
 
 async function runScan() {
@@ -113,33 +150,22 @@ async function runScan() {
   scannerStatus.lastRunAt = new Date().toISOString();
 
   try {
-    const res = await axios.get("https://api.binance.com/api/v3/ticker/24hr", { timeout: 15000 });
-    const rows = Array.isArray(res.data) ? res.data : [];
-    const usdtPairs = rows.filter((r) => typeof r.symbol === "string" && r.symbol.endsWith("USDT")).slice(0, 80);
+    const usdtPairs = await fetchPairs();
     scannerStatus.pairsChecked = usdtPairs.length;
 
-    // Store prices for /api/prices — include 24hr change data
-    lastPrices = usdtPairs.map((r) => ({
-      symbol: r.symbol,
-      price: r.lastPrice,
-      change: parseFloat(r.priceChangePercent) || 0,
-      volume: parseFloat(r.quoteVolume) || 0,
-      high: r.highPrice,
-      low: r.lowPrice,
-    }));
-
     let added = 0;
+
     for (const pair of usdtPairs) {
-      const rawPrice = Number(pair.lastPrice);
+      const rawPrice = Number(pair.price);
       if (!rawPrice || !Number.isFinite(rawPrice)) continue;
 
-      // Testing-only synthetic score so the UI gets data while you validate deployment.
-      const seed = pair.symbol.split("").reduce((a, ch) => a + ch.charCodeAt(0), 0);
-      const score = clamp((seed % 11) + 4, 0, 12);
+      const score = computeUnifiedScore100(pair.symbol, rawPrice);
 
-      if (score >= MIN_SCORE) {
+      // Unified threshold in the 0-100 system.
+      // 40 roughly matches the user's old visual expectation better than 8-12.
+      if (score >= 40) {
         const signal = makeSignal(pair.symbol, rawPrice, score);
-        if (mergeSignal(signal)) added++;
+        if (pushSignal(signal)) added++;
       }
     }
 
@@ -147,9 +173,15 @@ async function runScan() {
     scannerStatus.storedSignals = serverSignals.length;
     scannerStatus.lastSuccessAt = new Date().toISOString();
     scannerStatus.lastError = null;
+
     return added;
   } catch (err) {
-    scannerStatus.lastError = err.message || String(err);
+    scannerStatus.lastError =
+      err.response?.data?.msg ||
+      err.response?.statusText ||
+      err.message ||
+      String(err);
+
     console.error("Scan failed:", scannerStatus.lastError);
     return 0;
   }
@@ -167,10 +199,6 @@ function getSignals() {
   return serverSignals.slice(0, MAX_STORED_SIGNALS);
 }
 
-function getPrices() {
-  return lastPrices;
-}
-
 function getScannerStatus() {
   cleanupSignals();
   return {
@@ -182,6 +210,6 @@ function getScannerStatus() {
 module.exports = {
   startServerScanner,
   getSignals,
-  getPrices,
   getScannerStatus,
+  computeUnifiedScore100,
 };
